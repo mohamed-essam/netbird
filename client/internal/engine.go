@@ -131,6 +131,9 @@ type Engine struct {
 	clientCtx    context.Context
 	clientCancel context.CancelFunc
 
+	mgmClientCtx    context.Context
+	mgmClientCancel context.CancelFunc
+
 	ctx    context.Context
 	cancel context.CancelFunc
 
@@ -677,6 +680,8 @@ func (e *Engine) updateConfig(conf *mgmProto.PeerConfig) error {
 // receiveManagementEvents connects to the Management Service event stream to receive updates from the management service
 // E.g. when a new peer has been registered and we are allowed to connect to it.
 func (e *Engine) receiveManagementEvents() {
+	e.mgmClientCtx, e.mgmClientCancel = context.WithCancel(e.clientCtx)
+
 	go func() {
 		info, err := system.GetInfoWithChecks(e.ctx, e.checks)
 		if err != nil {
@@ -685,8 +690,13 @@ func (e *Engine) receiveManagementEvents() {
 		}
 
 		// err = e.mgmClient.Sync(info, e.handleSync)
-		err = e.mgmClient.Sync(e.ctx, info, e.handleSync)
+		err = e.mgmClient.Sync(e.mgmClientCtx, info, e.handleSync)
 		if err != nil {
+			if e.mgmClientCtx.Err() != nil && e.clientCtx.Err() == nil {
+				// Management context canceled, but client still running, indicates restarting management connection only
+				log.Debugf("shutting down management connection")
+				return
+			}
 			// happens if management is unavailable for a long time.
 			// We want to cancel the operation of the whole client
 			_ = CtxGetState(e.ctx).Wrap(ErrResetConnection)
@@ -747,8 +757,12 @@ func (e *Engine) updateNetworkMap(networkMap *mgmProto.NetworkMap) error {
 	}
 
 	serial := networkMap.GetSerial()
+	log.Tracef("received NetworkMap with serial %d", serial)
 	if e.networkSerial > serial {
-		log.Debugf("received outdated NetworkMap with serial %d, ignoring", serial)
+		log.Debugf("received outdated NetworkMap with serial %d, ignoring, current latest serial is %d", serial, e.networkSerial)
+		e.networkSerial = 0
+		e.mgmClientCancel()
+		e.receiveManagementEvents()
 		return nil
 	}
 
@@ -823,6 +837,7 @@ func (e *Engine) updateNetworkMap(networkMap *mgmProto.NetworkMap) error {
 	}
 
 	e.networkSerial = serial
+	log.Tracef("updated NetworkMap with serial %d", serial)
 
 	// Test received (upstream) servers for availability right away instead of upon usage.
 	// If no server of a server group responds this will disable the respective handler and retry later.
@@ -1106,6 +1121,11 @@ func (e *Engine) receiveSignalEvents() {
 
 			conn := e.peerConns[msg.Key]
 			if conn == nil {
+				if e.networkSerial > 0 {
+					e.networkSerial = 0
+					e.mgmClientCancel()
+					e.receiveManagementEvents()
+				}
 				return fmt.Errorf("wrongly addressed message %s", msg.Key)
 			}
 
