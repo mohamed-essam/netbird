@@ -31,14 +31,16 @@ import (
 )
 
 const (
-	storeSqliteFileName = "store.db"
-	idQueryCondition    = "id = ?"
+	storeSqliteFileName        = "store.db"
+	idQueryCondition           = "id = ?"
+	accountAndIDQueryCondition = "account_id = ? and id = ?"
+	peerNotFoundFMT            = "peer %s not found"
 )
 
 // SqlStore represents an account storage backed by a Sql DB persisted to disk
 type SqlStore struct {
 	db                *gorm.DB
-	accountLocks      sync.Map
+	resourceLocks     sync.Map
 	globalAccountLock sync.Mutex
 	metrics           telemetry.AppMetrics
 	installationPK    int
@@ -96,33 +98,35 @@ func (s *SqlStore) AcquireGlobalLock(ctx context.Context) (unlock func()) {
 	return unlock
 }
 
-func (s *SqlStore) AcquireAccountWriteLock(ctx context.Context, accountID string) (unlock func()) {
-	log.WithContext(ctx).Tracef("acquiring write lock for account %s", accountID)
+// AcquireWriteLockByUID acquires an ID lock for writing to a resource and returns a function that releases the lock
+func (s *SqlStore) AcquireWriteLockByUID(ctx context.Context, uniqueID string) (unlock func()) {
+	log.WithContext(ctx).Tracef("acquiring write lock for ID %s", uniqueID)
 
 	start := time.Now()
-	value, _ := s.accountLocks.LoadOrStore(accountID, &sync.RWMutex{})
+	value, _ := s.resourceLocks.LoadOrStore(uniqueID, &sync.RWMutex{})
 	mtx := value.(*sync.RWMutex)
 	mtx.Lock()
 
 	unlock = func() {
 		mtx.Unlock()
-		log.WithContext(ctx).Tracef("released write lock for account %s in %v", accountID, time.Since(start))
+		log.WithContext(ctx).Tracef("released write lock for ID %s in %v", uniqueID, time.Since(start))
 	}
 
 	return unlock
 }
 
-func (s *SqlStore) AcquireAccountReadLock(ctx context.Context, accountID string) (unlock func()) {
-	log.WithContext(ctx).Tracef("acquiring read lock for account %s", accountID)
+// AcquireReadLockByUID acquires an ID lock for writing to a resource and returns a function that releases the lock
+func (s *SqlStore) AcquireReadLockByUID(ctx context.Context, uniqueID string) (unlock func()) {
+	log.WithContext(ctx).Tracef("acquiring read lock for ID %s", uniqueID)
 
 	start := time.Now()
-	value, _ := s.accountLocks.LoadOrStore(accountID, &sync.RWMutex{})
+	value, _ := s.resourceLocks.LoadOrStore(uniqueID, &sync.RWMutex{})
 	mtx := value.(*sync.RWMutex)
 	mtx.RLock()
 
 	unlock = func() {
 		mtx.RUnlock()
-		log.WithContext(ctx).Tracef("released read lock for account %s in %v", accountID, time.Since(start))
+		log.WithContext(ctx).Tracef("released read lock for ID %s in %v", uniqueID, time.Since(start))
 	}
 
 	return unlock
@@ -130,6 +134,12 @@ func (s *SqlStore) AcquireAccountReadLock(ctx context.Context, accountID string)
 
 func (s *SqlStore) SaveAccount(ctx context.Context, account *Account) error {
 	start := time.Now()
+	defer func() {
+		elapsed := time.Since(start)
+		if elapsed > 1*time.Second {
+			log.WithContext(ctx).Tracef("SaveAccount for account %s exceeded 1s, took: %v", account.Id, elapsed)
+		}
+	}()
 
 	// todo: remove this check after the issue is resolved
 	s.checkAccountDomainBeforeSave(ctx, account.Id, account.Domain)
@@ -271,6 +281,38 @@ func (s *SqlStore) GetInstallationID() string {
 	return installation.InstallationIDValue
 }
 
+func (s *SqlStore) SavePeer(ctx context.Context, accountID string, peer *nbpeer.Peer) error {
+	// To maintain data integrity, we create a copy of the peer's to prevent unintended updates to other fields.
+	peerCopy := peer.Copy()
+	peerCopy.AccountID = accountID
+
+	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		// check if peer exists before saving
+		var peerID string
+		result := tx.Model(&nbpeer.Peer{}).Select("id").Find(&peerID, accountAndIDQueryCondition, accountID, peer.ID)
+		if result.Error != nil {
+			return result.Error
+		}
+
+		if peerID == "" {
+			return status.Errorf(status.NotFound, peerNotFoundFMT, peer.ID)
+		}
+
+		result = tx.Model(&nbpeer.Peer{}).Where(accountAndIDQueryCondition, accountID, peer.ID).Save(peerCopy)
+		if result.Error != nil {
+			return result.Error
+		}
+
+		return nil
+	})
+
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
 func (s *SqlStore) SavePeerStatus(accountID, peerID string, peerStatus nbpeer.PeerStatus) error {
 	var peerCopy nbpeer.Peer
 	peerCopy.Status = &peerStatus
@@ -281,14 +323,14 @@ func (s *SqlStore) SavePeerStatus(accountID, peerID string, peerStatus nbpeer.Pe
 	}
 	result := s.db.Model(&nbpeer.Peer{}).
 		Select(fieldsToUpdate).
-		Where("account_id = ? AND id = ?", accountID, peerID).
+		Where(accountAndIDQueryCondition, accountID, peerID).
 		Updates(&peerCopy)
 	if result.Error != nil {
 		return result.Error
 	}
 
 	if result.RowsAffected == 0 {
-		return status.Errorf(status.NotFound, "peer %s not found", peerID)
+		return status.Errorf(status.NotFound, peerNotFoundFMT, peerID)
 	}
 
 	return nil
@@ -302,7 +344,7 @@ func (s *SqlStore) SavePeerLocation(accountID string, peerWithLocation *nbpeer.P
 	peerCopy.Location = peerWithLocation.Location
 
 	result := s.db.Model(&nbpeer.Peer{}).
-		Where("account_id = ? and id = ?", accountID, peerWithLocation.ID).
+		Where(accountAndIDQueryCondition, accountID, peerWithLocation.ID).
 		Updates(peerCopy)
 
 	if result.Error != nil {
@@ -310,7 +352,7 @@ func (s *SqlStore) SavePeerLocation(accountID string, peerWithLocation *nbpeer.P
 	}
 
 	if result.RowsAffected == 0 {
-		return status.Errorf(status.NotFound, "peer %s not found", peerWithLocation.ID)
+		return status.Errorf(status.NotFound, peerNotFoundFMT, peerWithLocation.ID)
 	}
 
 	return nil
@@ -432,6 +474,34 @@ func (s *SqlStore) GetUserByTokenID(ctx context.Context, tokenID string) (*User,
 	return &user, nil
 }
 
+func (s *SqlStore) GetUserByUserID(ctx context.Context, userID string) (*User, error) {
+	var user User
+	result := s.db.First(&user, idQueryCondition, userID)
+	if result.Error != nil {
+		if errors.Is(result.Error, gorm.ErrRecordNotFound) {
+			return nil, status.Errorf(status.NotFound, "user not found: index lookup failed")
+		}
+		log.WithContext(ctx).Errorf("error when getting user from the store: %s", result.Error)
+		return nil, status.Errorf(status.Internal, "issue getting user from store")
+	}
+
+	return &user, nil
+}
+
+func (s *SqlStore) GetAccountGroups(ctx context.Context, accountID string) ([]*nbgroup.Group, error) {
+	var groups []*nbgroup.Group
+	result := s.db.Find(&groups, idQueryCondition, accountID)
+	if result.Error != nil {
+		if errors.Is(result.Error, gorm.ErrRecordNotFound) {
+			return nil, status.Errorf(status.NotFound, "accountID not found: index lookup failed")
+		}
+		log.WithContext(ctx).Errorf("error when getting groups from the store: %s", result.Error)
+		return nil, status.Errorf(status.Internal, "issue getting groups from store")
+	}
+
+	return groups, nil
+}
+
 func (s *SqlStore) GetAllAccounts(ctx context.Context) (all []*Account) {
 	var accounts []Account
 	result := s.db.Find(&accounts)
@@ -449,6 +519,13 @@ func (s *SqlStore) GetAllAccounts(ctx context.Context) (all []*Account) {
 }
 
 func (s *SqlStore) GetAccount(ctx context.Context, accountID string) (*Account, error) {
+	start := time.Now()
+	defer func() {
+		elapsed := time.Since(start)
+		if elapsed > 1*time.Second {
+			log.WithContext(ctx).Tracef("GetAccount for account %s exceeded 1s, took: %v", accountID, elapsed)
+		}
+	}()
 
 	var account Account
 	result := s.db.Model(&account).
@@ -644,7 +721,7 @@ func (s *SqlStore) GetAccountSettings(ctx context.Context, accountID string) (*S
 func (s *SqlStore) SaveUserLastLogin(accountID, userID string, lastLogin time.Time) error {
 	var user User
 
-	result := s.db.First(&user, "account_id = ? and id = ?", accountID, userID)
+	result := s.db.First(&user, accountAndIDQueryCondition, accountID, userID)
 	if result.Error != nil {
 		if errors.Is(result.Error, gorm.ErrRecordNotFound) {
 			return status.Errorf(status.NotFound, "user %s not found", userID)

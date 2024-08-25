@@ -12,9 +12,10 @@ import (
 	"strings"
 	"time"
 
-	nbgroup "github.com/netbirdio/netbird/management/server/group"
 	log "github.com/sirupsen/logrus"
 	"gorm.io/gorm"
+
+	nbgroup "github.com/netbirdio/netbird/management/server/group"
 
 	"github.com/netbirdio/netbird/management/server/telemetry"
 	"github.com/netbirdio/netbird/util"
@@ -40,6 +41,8 @@ type Store interface {
 	GetAccountByPrivateDomain(ctx context.Context, domain string) (*Account, error)
 	GetTokenIDByHashedToken(ctx context.Context, secret string) (string, error)
 	GetUserByTokenID(ctx context.Context, tokenID string) (*User, error)
+	GetUserByUserID(ctx context.Context, userID string) (*User, error)
+	GetAccountGroups(ctx context.Context, accountID string) ([]*nbgroup.Group, error)
 	GetPostureCheckByChecksDefinition(accountID string, checks *posture.ChecksDefinition) (*posture.Checks, error)
 	SaveAccount(ctx context.Context, account *Account) error
 	SaveUsers(accountID string, users map[string]*User) error
@@ -48,12 +51,13 @@ type Store interface {
 	DeleteTokenID2UserIDIndex(tokenID string) error
 	GetInstallationID() string
 	SaveInstallationID(ctx context.Context, ID string) error
-	// AcquireAccountWriteLock should attempt to acquire account lock for write purposes and return a function that releases the lock
-	AcquireAccountWriteLock(ctx context.Context, accountID string) func()
-	// AcquireAccountReadLock should attempt to acquire account lock for read purposes and return a function that releases the lock
-	AcquireAccountReadLock(ctx context.Context, accountID string) func()
+	// AcquireWriteLockByUID should attempt to acquire a lock for write purposes and return a function that releases the lock
+	AcquireWriteLockByUID(ctx context.Context, uniqueID string) func()
+	// AcquireReadLockByUID should attempt to acquire lock for read purposes and return a function that releases the lock
+	AcquireReadLockByUID(ctx context.Context, uniqueID string) func()
 	// AcquireGlobalLock should attempt to acquire a global lock and return a function that releases the lock
 	AcquireGlobalLock(ctx context.Context) func()
+	SavePeer(ctx context.Context, accountID string, peer *nbpeer.Peer) error
 	SavePeerStatus(accountID, peerID string, status nbpeer.PeerStatus) error
 	SavePeerLocation(accountID string, peer *nbpeer.Peer) error
 	SaveUserLastLogin(accountID, userID string, lastLogin time.Time) error
