@@ -210,6 +210,7 @@ require (
 	github.com/tklauser/go-sysconf v0.3.14 // indirect
 	github.com/tklauser/numcpus v0.8.0 // indirect
 	github.com/vishvananda/netns v0.0.4 // indirect
+	github.com/wlynxg/anet v0.0.5
 	github.com/yuin/goldmark v1.7.1 // indirect
 	github.com/zeebo/blake3 v0.2.3 // indirect
 	go.opencensus.io v0.24.0 // indirect

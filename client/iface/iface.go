@@ -9,6 +9,7 @@ import (
 	"github.com/hashicorp/go-multierror"
 	"github.com/pion/transport/v3"
 	log "github.com/sirupsen/logrus"
+	"github.com/wlynxg/anet"
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 
 	"github.com/netbirdio/netbird/client/errors"
@@ -73,16 +74,18 @@ func (w *WGIface) Address() device.WGAddress {
 }
 
 // ToInterface returns the net.Interface for the Wireguard interface
-func (r *WGIface) ToInterface() *net.Interface {
-	name := r.tun.DeviceName()
-	intf, err := net.InterfaceByName(name)
-	if err != nil {
-		log.Warnf("Failed to get interface by name %s: %v", name, err)
-		intf = &net.Interface{
-			Name: name,
+func (w *WGIface) ToInterface() *net.Interface {
+	name := w.tun.DeviceName()
+	ifs, err := anet.Interfaces()
+	for _, intf := range ifs {
+		if intf.Name == name {
+			return &intf
 		}
 	}
-	return intf
+	log.Warnf("Failed to get interface by name %s: %v", name, err)
+	return &net.Interface{
+		Name: name,
+	}
 }
 
 // Up configures a Wireguard interface
